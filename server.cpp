@@ -288,6 +288,54 @@ void Server::login(const json &data)
     user_info.clientfd = clientfd;
     user_info.status = 'y';
     users_cache[account] = user_info;
+
+    // 检查是否有离线消息，如果有则发送给客户端
+    if (!user_info.message.empty())
+    {
+        // 解析多条离线消息（使用|||作为分隔符）
+        string messages = user_info.message;
+        size_t pos = 0;
+        string delimiter = "|||";
+
+        while ((pos = messages.find(delimiter)) != string::npos || !messages.empty())
+        {
+            string single_message;
+            if (pos != string::npos)
+            {
+                single_message = messages.substr(0, pos);
+                messages.erase(0, pos + delimiter.length());
+            }
+            else
+            {
+                single_message = messages;
+                messages.clear();
+            }
+
+            if (!single_message.empty())
+            {
+                // 发送单条离线消息
+                string msg_with_newline = single_message + "\n";
+                if (send(clientfd, msg_with_newline.c_str(), msg_with_newline.length(), 0) < 0)
+                {
+                    perror("send offline message");
+                    break;
+                }
+            }
+
+            if (messages.empty())
+                break;
+        }
+
+        // 清空数据库中的离线消息
+        snprintf(query, sizeof(query),
+                 "UPDATE users SET message = '' WHERE account = '%s'",
+                 account.c_str());
+        update_sql(query);
+
+        // 更新缓存中的消息字段
+        user_info.message = "";
+        users_cache[account] = user_info;
+    }
 }
 
 bool Server::account_exists(const std::string &account)
@@ -353,9 +401,115 @@ void Server::sign_in(const json &data)
 // 处理私发请求
 void Server::private_send(const json &data)
 {
-    string account = data["source_account"];
+    string source_account = data["source_account"];
     string destination_account = data["destination_account"];
-    string content = data["content"];
+    string message = data["message"];
+
+    // 检查目标账户是否存在于缓存中（即是否在线）
+    auto target_it = users_cache.find(destination_account);
+
+    if (target_it != users_cache.end())
+    {
+        // 目标用户在线，直接发送消息
+        int target_clientfd = target_it->second.clientfd;
+
+        // 构造要发送的消息格式
+        json response_msg;
+        response_msg["type"] = "private_message";
+        response_msg["from"] = source_account;
+        response_msg["message"] = message;
+
+        string msg_str = response_msg.dump() + "\n";
+
+        // 发送消息给目标用户
+        if (send(target_clientfd, msg_str.c_str(), msg_str.length(), 0) < 0)
+        {
+            perror("send private message to online user");
+            return;
+        }
+    }
+    else
+    {
+        // 目标用户不在线，先检查账户是否存在
+        if (!account_exists(destination_account))
+        {
+            // 目标账户不存在
+            buffer = "destination account does not exist\n";
+            if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
+            {
+                perror("send account not exist response");
+            }
+            return;
+        }
+
+        // 目标账户存在但不在线，存储消息到数据库
+        json offline_msg;
+        offline_msg["type"] = "private_message";
+        offline_msg["from"] = source_account;
+        offline_msg["message"] = message;
+        offline_msg["timestamp"] = time(nullptr); // 添加时间戳
+
+        string stored_message = offline_msg.dump();
+
+        // 获取当前存储的消息
+        char query[256];
+        snprintf(query, sizeof(query),
+                 "SELECT message FROM users WHERE account = '%s'",
+                 destination_account.c_str());
+
+        string existing_messages = "";
+        if (select_sql(query, destination_account))
+        {
+            auto temp_it = users_cache.find(destination_account);
+            if (temp_it != users_cache.end())
+            {
+                existing_messages = temp_it->second.message;
+            }
+        }
+
+        // 将新消息追加到现有消息后面（用分隔符分隔）
+        string updated_messages = existing_messages;
+        if (!existing_messages.empty())
+        {
+            updated_messages += "|||"; // 使用|||作为消息分隔符
+        }
+        updated_messages += stored_message;
+
+        // 更新数据库中的message字段
+        char update_query[1024];
+        snprintf(update_query, sizeof(update_query),
+                 "UPDATE users SET message = '%s' WHERE account = '%s'",
+                 updated_messages.c_str(), destination_account.c_str());
+
+        if (update_sql(update_query))
+        {
+            // 存储成功，给源用户发送确认
+            buffer = "message stored for offline user\n";
+            if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
+            {
+                perror("send stored response");
+            }
+
+            printf("Private message from %s stored for offline user %s\n",
+                   source_account.c_str(), destination_account.c_str());
+        }
+        else
+        {
+            // 存储失败
+            buffer = "failed to store message\n";
+            if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
+            {
+                perror("send store failed response");
+            }
+        }
+
+        // 清理临时缓存数据
+        if (users_cache.find(destination_account) != users_cache.end() &&
+            target_it == users_cache.end())
+        {
+            users_cache.erase(destination_account);
+        }
+    }
 }
 
 // 处理群发请求
@@ -373,7 +527,7 @@ bool Server::quitlog(string &account)
     update_sql(query);
     printf("quit log success\n");
     auto it = users_cache.find(account);
-    buffer = "quit log\n";
+    buffer = "quit log success\n";
     if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
     {
         perror("quit log");
