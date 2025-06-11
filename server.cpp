@@ -226,6 +226,37 @@ inline bool Server::update_sql(const char *update_sql)
     return true;
 }
 
+// 强制退出指定账户的其他登录
+bool Server::force_logout_other_client(const string &account)
+{
+    auto it = users_cache.find(account);
+    if (it != users_cache.end() && it->second.status == 'y')
+    {
+        int old_clientfd = it->second.clientfd;
+
+        // 更新数据库状态
+        char query[256];
+        snprintf(query, sizeof(query),
+                 "UPDATE users SET clientfd = -1, status = 'n' WHERE account = '%s'",
+                 account.c_str());
+        update_sql(query);
+
+        // 发送强制下线通知给被踢下线的客户端
+        string logout_msg = "force_logout:You have been logged out because this account logged in elsewhere\n";
+        send(old_clientfd, logout_msg.c_str(), logout_msg.length(), 0);
+
+        // 清理映射关系
+        fdAccount.erase(old_clientfd);
+
+        // 关闭旧的客户端连接
+        close_single(old_clientfd);
+
+        printf("Forced logout for account %s from clientfd %d\n", account.c_str(), old_clientfd);
+        return true;
+    }
+    return false;
+}
+
 // 处理登录请求
 void Server::login(const json &data)
 {
@@ -244,54 +275,63 @@ void Server::login(const json &data)
     {
         buffer = "no account\n";
         printf("no account\n");
-        if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
+        if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
             perror("log send");
             return;
         }
+        fdAccount.erase(clientfd);
         return;
     }
 
     UserInfo user_info = users_cache[account];
-    if (user_info.password == pwd)
-    {
-        buffer = " log success\n";
-        printf("log success\n");
-        if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
-        {
-            perror("log send");
-            return;
-        }
-    }
-    else if (user_info.password != pwd)
+
+    // 验证密码
+    if (user_info.password != pwd)
     {
         buffer = "password error\n";
         printf("password error\n");
-        if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
+        if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
             perror("log send");
             return;
         }
+        fdAccount.erase(clientfd);
         return;
     }
 
-    // 处于登录状态则推出当前登录重新登录，没有登录直接登录
-    if (user_info.status = 'y')
+    // 如果该账户已经在其他地方登录，强制退出其他客户端
+    if (user_info.status == 'y' && user_info.clientfd != clientfd)
     {
-        if (!quitlog(account))
-            return;
+        printf("Account %s is already logged in from clientfd %d, forcing logout\n",
+               account.c_str(), user_info.clientfd);
+        force_logout_other_client(account);
     }
+
+    // 更新数据库和缓存，设置当前客户端为已登录
     snprintf(query, sizeof(query),
              "UPDATE users SET clientfd = %d, status = 'y' WHERE account = '%s'",
              clientfd, account.c_str());
     update_sql(query);
+
     user_info.clientfd = clientfd;
     user_info.status = 'y';
     users_cache[account] = user_info;
 
+    // 发送登录成功消息
+    buffer = "log success\n";
+    printf("log success for account %s on clientfd %d\n", account.c_str(), clientfd);
+    if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
+    {
+        perror("log send");
+        return;
+    }
+
     // 检查是否有离线消息，如果有则发送给客户端
     if (!user_info.message.empty())
     {
+        printf("Sending offline messages to %s\n", account.c_str());
+
         // 解析多条离线消息（使用|||作为分隔符）
         string messages = user_info.message;
         size_t pos = 0;
@@ -335,9 +375,12 @@ void Server::login(const json &data)
         // 更新缓存中的消息字段
         user_info.message = "";
         users_cache[account] = user_info;
+
+        printf("All offline messages sent to %s\n", account.c_str());
     }
 }
 
+// 判断账号是否存在
 bool Server::account_exists(const std::string &account)
 {
     char query[256];
@@ -379,18 +422,17 @@ void Server::sign_in(const json &data)
         update_sql(query);
         printf("sign in success\n");
         buffer = "sign in success\n";
-        if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
+        if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
             perror("sign in success");
             return;
         }
-        login(data);
     }
     else
     {
         buffer = "account exist\n";
         printf("sign in false\n");
-        if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
+        if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
             perror("sign in false");
             return;
@@ -520,22 +562,40 @@ void Server::group_send(const json &data)
 // 处理退出登录
 bool Server::quitlog(string &account)
 {
+    auto it = users_cache.find(account);
+    if (it == users_cache.end())
+    {
+        printf("Account %s not found in cache\n", account.c_str());
+        return false;
+    }
+
+    int user_clientfd = it->second.clientfd;
+
+    // 更新数据库状态
     char query[256];
     snprintf(query, sizeof(query),
              "UPDATE users SET clientfd = -1, status = 'n' WHERE account = '%s'",
              account.c_str());
     update_sql(query);
-    printf("quit log success\n");
-    auto it = users_cache.find(account);
+
+    printf("quit log success for account %s\n", account.c_str());
+
+    // 发送退出成功消息
     buffer = "quit log success\n";
-    if (send(clientfd, buffer.c_str(), sizeof(buffer), 0) < 0)
+    if (send(user_clientfd, buffer.c_str(), buffer.length(), 0) < 0)
     {
         perror("quit log");
-        return false;
     }
-    fdAccount.erase(it->second.clientfd);
-    close_single(it->second.clientfd);
+
+    // 清理映射关系
+    fdAccount.erase(user_clientfd);
+
+    // 关闭客户端连接
+    close_single(user_clientfd);
+
+    // 从缓存中移除用户信息
     users_cache.erase(account);
+
     return true;
 }
 

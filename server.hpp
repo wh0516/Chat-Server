@@ -89,6 +89,9 @@ private:
     // 更新数据库
     bool update_sql(const char *);
 
+    // 强制退出其他客户端的登录
+    bool force_logout_other_client(const string &account);
+
     // 0处理登陆
     void login(const json &);
 
