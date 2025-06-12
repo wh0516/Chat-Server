@@ -368,7 +368,7 @@ void Server::login(const json &data)
 
         // 清空数据库中的离线消息
         snprintf(query, sizeof(query),
-                 "UPDATE users SET message = '' WHERE account = '%s'",
+                 "UPDATE users SET message = null WHERE account = '%s'",
                  account.c_str());
         update_sql(query);
 
@@ -642,7 +642,7 @@ void Server::process_client()
             string flag = data_json["type"];
 
             // 处理登陆
-            if (flag == "login")
+            if (flag == "log in")
                 login(data_json);
 
             // 处理注册
