@@ -49,18 +49,19 @@ private:
         BUFFER_SIZE = 1024  // 最大缓存区
     };
 
-    sockaddr_in server_addr, client_addr;        // 服务端地址配置
-    socklen_t client_len = sizeof(client_addr);  // 地址长度
-    string port;                                 // 端口
-    int listenfd;                                // 监听文件描述符
-    int clientfd;                                // 客服端fd
-    pollfd fds[MAX_CLIENTS + 1];                 // pollfd结构
-    int nfds;                                    // 活跃描述符数量
-    string buffer;                               // 缓冲区
-    MYSQL *con;                                  // mysql连接
-    unordered_map<string, UserInfo> users_cache; // account与数据库数据映射
-    unordered_map<int, int> fdIdx;               // clientfd and Idx
-    unordered_map<int, string> fdAccount;        // clientfd and account
+    sockaddr_in server_addr, client_addr;                // 服务端地址配置
+    socklen_t client_len = sizeof(client_addr);          // 地址长度
+    string port;                                         // 端口
+    int listenfd;                                        // 监听文件描述符
+    int clientfd;                                        // 客服端fd
+    pollfd fds[MAX_CLIENTS + 1];                         // pollfd结构
+    int nfds;                                            // 活跃描述符数量
+    string buffer;                                       // 缓冲区
+    MYSQL *con;                                          // mysql连接
+    unordered_map<string, UserInfo> users_cache;         // account与数据库数据映射
+    unordered_map<int, int> fdIdx;                       // clientfd and Idx
+    unordered_map<int, string> fdAccount;                // clientfd and account
+    std::unordered_map<int, std::string> client_buffers; // 客户端接收缓冲区
 
     // 初始化服务器
     bool initial();
@@ -70,6 +71,9 @@ private:
 
     // 接受连接
     bool accept();
+
+    // 处理单条消息
+    void handle_single_message(const string &);
 
     // 客服端任务处理
     void process_client();

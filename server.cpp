@@ -147,6 +147,7 @@ inline bool Server::close_single(int &clientfd)
     fds[fdIdx[clientfd]].events = 0;
     fds[fdIdx[clientfd]].revents = 0;
     fdIdx.erase(clientfd);
+    client_buffers.erase(clientfd);
     return true;
 }
 
@@ -242,7 +243,7 @@ bool Server::force_logout_other_client(const string &account)
         update_sql(query);
 
         // 发送强制下线通知给被踢下线的客户端
-        string logout_msg = "force_logout:You have been logged out because this account logged in elsewhere\n";
+        string logout_msg = "force_logout:You have been logged out because this account logged in elsewhere\r\n";
         send(old_clientfd, logout_msg.c_str(), logout_msg.length(), 0);
 
         // 清理映射关系
@@ -273,7 +274,7 @@ void Server::login(const json &data)
     // 返回空值代表没有账号在数据库
     if (!select_sql(query, account))
     {
-        buffer = "no account\n";
+        buffer = "no account\r\n";
         printf("no account\n");
         if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
@@ -289,7 +290,7 @@ void Server::login(const json &data)
     // 验证密码
     if (user_info.password != pwd)
     {
-        buffer = "password error\n";
+        buffer = "password error\r\n";
         printf("password error\n");
         if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
@@ -319,7 +320,7 @@ void Server::login(const json &data)
     users_cache[account] = user_info;
 
     // 发送登录成功消息
-    buffer = "log success\n";
+    buffer = "log success\r\n";
     printf("log success for account %s on clientfd %d\n", account.c_str(), clientfd);
     if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
     {
@@ -354,7 +355,7 @@ void Server::login(const json &data)
             if (!single_message.empty())
             {
                 // 发送单条离线消息
-                string msg_with_newline = single_message + "\n";
+                string msg_with_newline = single_message + "\r\n";
                 if (send(clientfd, msg_with_newline.c_str(), msg_with_newline.length(), 0) < 0)
                 {
                     perror("send offline message");
@@ -421,7 +422,7 @@ void Server::sign_in(const json &data)
                  account.c_str(), pwd.c_str());
         update_sql(query);
         printf("sign in success\n");
-        buffer = "sign in success\n";
+        buffer = "sign in success\r\n";
         if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
             perror("sign in success");
@@ -430,7 +431,7 @@ void Server::sign_in(const json &data)
     }
     else
     {
-        buffer = "account exist\n";
+        buffer = "account exist\r\n";
         printf("sign in false\n");
         if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
         {
@@ -461,7 +462,7 @@ void Server::private_send(const json &data)
         response_msg["from"] = source_account;
         response_msg["message"] = message;
 
-        string msg_str = response_msg.dump() + "\n";
+        string msg_str = response_msg.dump() + "\r\n";
 
         // 发送消息给目标用户
         if (send(target_clientfd, msg_str.c_str(), msg_str.length(), 0) < 0)
@@ -476,7 +477,7 @@ void Server::private_send(const json &data)
         if (!account_exists(destination_account))
         {
             // 目标账户不存在
-            buffer = "destination account does not exist\n";
+            buffer = "destination account does not exist\r\n";
             if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
             {
                 perror("send account not exist response");
@@ -526,7 +527,7 @@ void Server::private_send(const json &data)
         if (update_sql(update_query))
         {
             // 存储成功，给源用户发送确认
-            buffer = "message stored for offline user\n";
+            buffer = "message stored for offline user\r\n";
             if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
             {
                 perror("send stored response");
@@ -538,7 +539,7 @@ void Server::private_send(const json &data)
         else
         {
             // 存储失败
-            buffer = "failed to store message\n";
+            buffer = "failed to store message\r\n";
             if (send(clientfd, buffer.c_str(), buffer.length(), 0) < 0)
             {
                 perror("send store failed response");
@@ -581,7 +582,7 @@ bool Server::quitlog(string &account)
     printf("quit log success for account %s\n", account.c_str());
 
     // 发送退出成功消息
-    buffer = "quit log success\n";
+    buffer = "quit log success\r\n";
     if (send(user_clientfd, buffer.c_str(), buffer.length(), 0) < 0)
     {
         perror("quit log");
@@ -602,73 +603,72 @@ bool Server::quitlog(string &account)
 // 处理客服端请求
 void Server::process_client()
 {
-    string data;
-    while (true)
+    char temp_buffer[BUFFER_SIZE];
+    ssize_t bytes_read = recv(clientfd, temp_buffer, BUFFER_SIZE - 1, 0);
+
+    printf("Received %ld bytes from client %d\n", bytes_read, clientfd);
+
+    if (bytes_read > 0)
     {
-        ssize_t bytes_read = recv(clientfd, buffer.data(), BUFFER_SIZE - 1, 0);
-        if (bytes_read > 0)
+        // 将接收到的数据追加到客户端缓冲区
+        client_buffers[clientfd].append(temp_buffer, bytes_read);
+
+        // 处理缓冲区中所有完整的消息
+        string &client_buffer = client_buffers[clientfd];
+        size_t pos;
+
+        while ((pos = client_buffer.find("\r\n")) != string::npos)
         {
-            data.append(buffer.data(), bytes_read);
-            if (data.find("\n") != string::npos)
+            string message = client_buffer.substr(0, pos);
+            client_buffer.erase(0, pos + 2);
+
+            printf("Processing message: '%s'\n", message.c_str());
+
+            // 处理单条消息
+            if (!message.empty())
             {
-                break;
+                handle_single_message(message);
             }
-        }
-        else if (bytes_read == 0) // 客服端关闭
-        {
-            printf("client close\n");
-            handle_logout_or_close();
-            return;
-        }
-        else
-        {
-            handle_logout_or_close();
-            return;
         }
     }
-
-    if (data.size() > 0)
+    else if (bytes_read == 0)
     {
-        if (data.back() == '\n')
-        {
-            data.pop_back();
-        }
+        printf("Client %d disconnected\n", clientfd);
+        client_buffers.erase(clientfd); // 清理缓冲区
+        handle_logout_or_close();
+        return;
+    }
+    else
+    {
+        printf("Recv error for client %d: %s\n", clientfd, strerror(errno));
+        client_buffers.erase(clientfd); // 清理缓冲区
+        handle_logout_or_close();
+        return;
+    }
+}
 
-        try
-        {
-            json data_json = json::parse(data);
+// 处理单条消息
+void Server::handle_single_message(const string &message)
+{
+    try
+    {
+        json data_json = json::parse(message);
+        string flag = data_json["type"];
 
-            // 查看请求任务类型
-            string flag = data_json["type"];
-
-            // 处理登陆
-            if (flag == "log in")
-                login(data_json);
-
-            // 处理注册
-            else if (flag == "sign in")
-            {
-                sign_in(data_json);
-            }
-
-            // 处理私发
-            else if (flag == "private send")
-                private_send(data_json);
-
-            // 处理群发
-            else if (flag == "group send")
-                group_send(data_json);
-
-            // 处理退出
-            else if (flag == "quit")
-            {
-                quitlog(fdAccount[clientfd]);
-            }
-        }
-        catch (const json::parse_error &e)
-        {
-            std::cerr << "JSON解析错误: " << e.what() << std::endl;
-        }
+        if (flag == "log in")
+            login(data_json);
+        else if (flag == "sign in")
+            sign_in(data_json);
+        else if (flag == "private send")
+            private_send(data_json);
+        else if (flag == "group send")
+            group_send(data_json);
+        else if (flag == "quit")
+            quitlog(fdAccount[clientfd]);
+    }
+    catch (const json::parse_error &e)
+    {
+        std::cerr << "JSON解析错误: " << e.what() << std::endl;
     }
 }
 
