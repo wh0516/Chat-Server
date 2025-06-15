@@ -6,7 +6,7 @@
         "account": "", 
         "password": ""
     }
-    使用dump()函数将json格式转化为string在尾部增加\n防止粘包
+    使用dump()函数将json格式转化为string在尾部增加\r\n防止粘包
     TCP传输是可靠传输，一般不会有丢包、包乱序的问题
     服务端的login函数负责处理请求登录，流程图如下
 ![登录流程图](./image/登录流程图.png)

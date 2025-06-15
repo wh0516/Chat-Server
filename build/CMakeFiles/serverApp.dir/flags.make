@@ -6,5 +6,5 @@ CXX_DEFINES =
 
 CXX_INCLUDES = -I/home/wh/桌面/data_struct/network/project/Server/include -I/usr/include/mysql
 
-CXX_FLAGS = 
+CXX_FLAGS = -std=gnu++17
 

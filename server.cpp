@@ -188,8 +188,8 @@ bool Server::select_sql(const char *query_sql, const string &account)
         UserInfo user_info;
         for (int i = 0; i < num_fields; i++)
         {
-            std::string field_name = fields[i].name;
-            std::string field_value = row[i] ? row[i] : "";
+            string field_name = fields[i].name;
+            string field_value = row[i] ? row[i] : "";
 
             if (field_name == "password")
             {
@@ -382,7 +382,7 @@ void Server::login(const json &data)
 }
 
 // 判断账号是否存在
-bool Server::account_exists(const std::string &account)
+bool Server::account_exists(const string &account)
 {
     char query[256];
     snprintf(query, sizeof(query),
@@ -560,6 +560,78 @@ void Server::group_send(const json &data)
 {
 }
 
+// 处理文件接收
+void Server::file_recv(const json &data)
+{
+    string filename = data["filename"];
+    long file_size = data["file_size"];
+
+    // 验证文件大小
+    if (file_size <= 0 || file_size > 1024 * 1024 * 1024) // 限制最大1GB
+    {
+        const char *error_msg = "INVALID_FILE_SIZE\r\n";
+        send(clientfd, error_msg, strlen(error_msg), 0);
+        return;
+    }
+
+    string username = fdAccount[clientfd];
+    if (username.empty())
+    {
+        const char *error_msg = "USER_NOT_LOGGED_IN\r\n";
+        send(clientfd, error_msg, strlen(error_msg), 0);
+        return;
+    }
+
+    string dir_path = "../Storage/" + username;
+    string full_path = dir_path + "/" + filename;
+
+    try
+    {
+        // 创建目录
+        if (!filesystem::exists(dir_path))
+        {
+            filesystem::create_directories(dir_path);
+        }
+
+        // 检查是否已在接收其他文件
+        if (file_states.count(clientfd) && file_states[clientfd].is_receiving_file)
+        {
+            const char *error_msg = "ALREADY_RECEIVING_FILE\r\n";
+            send(clientfd, error_msg, strlen(error_msg), 0);
+            return;
+        }
+
+        // 准备文件接收状态
+        FileReceiveState &state = file_states[clientfd];
+        state.filename = filename;
+        state.expected_size = file_size;
+        state.received_size = 0;
+        state.file_stream.open(full_path, ios::binary);
+
+        if (!state.file_stream.is_open())
+        {
+            const char *error_msg = "FILE_CREATE_FAILED\r\n";
+            send(clientfd, error_msg, strlen(error_msg), 0);
+            file_states.erase(clientfd);
+            return;
+        }
+
+        // 设置为文件接收模式
+        state.is_receiving_file = true;
+
+        // 发送准备就绪确认
+        const char *ready_msg = "FILE_READY\r\n";
+        send(clientfd, ready_msg, strlen(ready_msg), 0);
+    }
+    catch (const exception &e)
+    {
+        cerr << "error: " << e.what() << endl;
+        const char *error_msg = "DIRECTORY_CREATE_FAILED";
+        send(clientfd, error_msg, strlen(error_msg), 0);
+        return;
+    }
+}
+
 // 处理退出登录
 bool Server::quitlog(string &account)
 {
@@ -600,50 +672,161 @@ bool Server::quitlog(string &account)
     return true;
 }
 
-// 处理客服端请求
+// 清理文件接收资源
+void Server::cleanup_client(int client_fd, bool disconnect = false)
+{
+    // 清理文件接收状态
+    auto file_it = file_states.find(client_fd);
+    if (file_it != file_states.end())
+    {
+        if (file_it->second.file_stream.is_open())
+        {
+            file_it->second.file_stream.close();
+            printf("Closed incomplete file: %s\n", file_it->second.filename.c_str());
+        }
+
+        // 只有在不断开连接时才发送错误消息
+        if (!disconnect)
+        {
+            const char *error_msg = "FILE_TRANSFER_FAILED\r\n";
+            send(client_fd, error_msg, strlen(error_msg), 0);
+        }
+
+        file_states.erase(file_it);
+    }
+
+    // 如果需要断开连接，清理所有资源
+    if (disconnect)
+    {
+        client_buffers.erase(client_fd);
+        handle_logout_or_close();
+    }
+}
+
+// 处理接收文件数据
+void Server::receive_file_data()
+{
+    FileReceiveState &state = file_states[clientfd];
+    string &client_buffer = client_buffers[clientfd];
+
+    // 处理缓冲区中已有的数据
+    while (!client_buffer.empty() && state.received_size < state.expected_size)
+    {
+        long remaining = state.expected_size - state.received_size;
+        size_t bytes_to_process = min((size_t)remaining, client_buffer.size());
+
+        // 写入文件
+        state.file_stream.write(client_buffer.c_str(), bytes_to_process);
+        if (state.file_stream.fail())
+        {
+            printf("Error writing to file: %s\n", state.filename.c_str());
+            cleanup_client(clientfd, false);
+            return;
+        }
+
+        state.received_size += bytes_to_process;
+
+        // 从缓冲区中移除已处理的数据
+        client_buffer.erase(0, bytes_to_process);
+
+        // 显示进度
+        if (state.received_size - state.last_progress_size >= 1024 * 1024 ||
+            state.received_size >= state.expected_size)
+        {
+            printf("File progress: %ld/%ld bytes (%.1f%%)\n",
+                   state.received_size, state.expected_size,
+                   (double)state.received_size / state.expected_size * 100);
+            state.last_progress_size = state.received_size;
+        }
+
+        // 检查是否接收完成
+        if (state.received_size >= state.expected_size)
+        {
+            state.file_stream.close();
+            printf("File received successfully: %s\n", state.filename.c_str());
+
+            const char *complete_msg = "FILE_COMPLETE\r\n";
+            send(clientfd, complete_msg, strlen(complete_msg), 0);
+
+            // 重置状态
+            state.is_receiving_file = false;
+            state.filename = "";
+            state.expected_size = 0;
+            state.received_size = 0;
+            state.last_progress_size = 0;
+
+            printf("File transfer completed, switching back to message mode\n");
+            return;
+        }
+    }
+}
+
+// 处理客户端请求
 void Server::process_client()
 {
     char temp_buffer[BUFFER_SIZE];
-    ssize_t bytes_read = recv(clientfd, temp_buffer, BUFFER_SIZE - 1, 0);
 
-    printf("Received %ld bytes from client %d\n", bytes_read, clientfd);
-
-    if (bytes_read > 0)
+    while (true)
     {
-        // 将接收到的数据追加到客户端缓冲区
-        client_buffers[clientfd].append(temp_buffer, bytes_read);
+        ssize_t bytes_read = recv(clientfd, temp_buffer, BUFFER_SIZE - 1, MSG_DONTWAIT);
 
-        // 处理缓冲区中所有完整的消息
-        string &client_buffer = client_buffers[clientfd];
-        size_t pos;
-
-        while ((pos = client_buffer.find("\r\n")) != string::npos)
+        if (bytes_read > 0)
         {
-            string message = client_buffer.substr(0, pos);
-            client_buffer.erase(0, pos + 2);
-
-            printf("Processing message: '%s'\n", message.c_str());
-
-            // 处理单条消息
-            if (!message.empty())
+            // 处理接收到的数据
+            client_buffers[clientfd].append(temp_buffer, bytes_read);
+        }
+        else if (bytes_read == 0)
+        {
+            printf("Client %d disconnected\n", clientfd);
+            client_buffers.erase(clientfd);
+            handle_logout_or_close();
+            return;
+        }
+        else
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                handle_single_message(message);
+                break; // 没有更多数据可读
+            }
+            else
+            {
+                printf("Recv error for client %d: %s\n", clientfd, strerror(errno));
+                client_buffers.erase(clientfd);
+                handle_logout_or_close();
+                return;
             }
         }
     }
-    else if (bytes_read == 0)
+
+    // 检查是否正在接收文件
+    if (file_states.count(clientfd) && file_states[clientfd].is_receiving_file)
     {
-        printf("Client %d disconnected\n", clientfd);
-        client_buffers.erase(clientfd); // 清理缓冲区
-        handle_logout_or_close();
+        // 文件接收模式
+        receive_file_data();
         return;
     }
-    else
+
+    // 处理缓冲区中的完整消息
+    string &client_buffer = client_buffers[clientfd];
+    size_t pos;
+    while ((pos = client_buffer.find("\r\n")) != string::npos)
     {
-        printf("Recv error for client %d: %s\n", clientfd, strerror(errno));
-        client_buffers.erase(clientfd); // 清理缓冲区
-        handle_logout_or_close();
-        return;
+        string message = client_buffer.substr(0, pos);
+        client_buffer.erase(0, pos + 2);
+
+        // 处理json接收
+        if (!message.empty())
+        {
+            handle_single_message(message);
+            if (file_states.count(clientfd) && file_states[clientfd].is_receiving_file)
+            {
+                if (!client_buffer.empty())
+                {
+                    receive_file_data();
+                }
+                break; // 退出消息处理循环
+            }
+        }
     }
 }
 
@@ -663,12 +846,14 @@ void Server::handle_single_message(const string &message)
             private_send(data_json);
         else if (flag == "group send")
             group_send(data_json);
+        else if (flag == "file send")
+            file_recv(data_json);
         else if (flag == "quit")
             quitlog(fdAccount[clientfd]);
     }
     catch (const json::parse_error &e)
     {
-        std::cerr << "JSON解析错误: " << e.what() << std::endl;
+        cerr << "JSON解析错误: " << e.what() << endl;
     }
 }
 
